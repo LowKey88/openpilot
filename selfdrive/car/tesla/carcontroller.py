@@ -33,18 +33,18 @@ class CarController(CarControllerBase):
     self.pt_packer = CANPacker(DBC[CP.carFingerprint]['pt'])
     self.tesla_can = TeslaCAN(self.packer, self.pt_packer)
     self.virtual_blending = Params().get_bool("VirtualTorqueBlending")
-    self.cc_cancel_counter = 0
+    self.first_cc_cancel_nanos = None
 
   def update(self, CC, CS, now_nanos, frogpilot_toggles):
     actuators = CC.actuators
     # OEM system should automatically cancel, we'll only send cancel cmd as a backup.
-    # Counter is necessary due to race condition between state and control, sending cancel
+    # Timer is necessary due to race condition between state and control, sending cancel
     # when not necessary results in a dashboard alert.
-    if CC.cruiseControl.cancel:
-      self.cc_cancel_counter += 1
-    else:
-      self.cc_cancel_counter = 0
-    pcm_cancel_cmd = self.cc_cancel_counter >= 2
+    if CC.cruiseControl.cancel and self.first_cc_cancel_nanos is None:
+      self.first_cc_cancel_nanos = now_nanos
+    if not CC.cruiseControl.cancel:
+      self.first_cc_cancel_nanos = None
+    pcm_cancel_cmd = CC.cruiseControl.cancel and now_nanos - self.first_cc_cancel_nanos > 250000  # 250ms
 
     can_sends = []
 
@@ -97,13 +97,11 @@ class CarController(CarControllerBase):
       counter = CS.das_control["DAS_controlCounter"]
       can_sends.append(self.tesla_can.create_longitudinal_commands(acc_state, target_speed, min_accel, max_accel, counter))
 
-    if not self.virtual_blending:
-      # Cancel on user steering override when blending is disabled
-      if CS.steering_override:
-        pcm_cancel_cmd = True
+    # Cancel on user steering override, since there is no steering torque blending
+    if hands_on_fault and CS.acc_enabled:
+      pcm_cancel_cmd = True
 
-    # Send cancel request only if ACC is enabled
-    if self.frame % 10 == 0 and pcm_cancel_cmd and CS.acc_enabled:
+    if self.frame % 10 == 0 and pcm_cancel_cmd:
       counter = int(CS.sccm_right_stalk_counter)
       can_sends.append(self.tesla_can.right_stalk_press((counter + 1) % 16 , 1))  # half up (cancel acc)
 
