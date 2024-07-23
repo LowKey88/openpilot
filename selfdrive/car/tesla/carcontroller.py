@@ -1,4 +1,5 @@
 from openpilot.common.numpy_fast import clip
+from openpilot.common.params import Params
 from opendbc.can.packer import CANPacker
 from openpilot.selfdrive.car import apply_std_steer_angle_limits
 from openpilot.selfdrive.car.interfaces import CarControllerBase
@@ -31,19 +32,19 @@ class CarController(CarControllerBase):
     self.packer = CANPacker(dbc_name)
     self.pt_packer = CANPacker(DBC[CP.carFingerprint]['pt'])
     self.tesla_can = TeslaCAN(self.packer, self.pt_packer)
-    self.first_cc_cancel_nanos = None
+    self.virtual_blending = Params().get_bool("VirtualTorqueBlending")
+    self.cc_cancel_counter = 0
 
-  def update(self, CC, CS, now_nanos):
-
+  def update(self, CC, CS, now_nanos, frogpilot_toggles):
     actuators = CC.actuators
     # OEM system should automatically cancel, we'll only send cancel cmd as a backup.
-    # Timer is necessary due to race condition between state and control, sending cancel
+    # Counter is necessary due to race condition between state and control, sending cancel
     # when not necessary results in a dashboard alert.
-    if CC.cruiseControl.cancel and self.first_cc_cancel_nanos is None:
-      self.first_cc_cancel_nanos = now_nanos
-    if not CC.cruiseControl.cancel:
-      self.first_cc_cancel_nanos = None
-    pcm_cancel_cmd = CC.cruiseControl.cancel and now_nanos - self.first_cc_cancel_nanos > 1e9  # 1s
+    if CC.cruiseControl.cancel:
+      self.cc_cancel_counter += 1
+    else:
+      self.cc_cancel_counter = 0
+    pcm_cancel_cmd = self.cc_cancel_counter >= 2
 
     can_sends = []
 
@@ -68,8 +69,11 @@ class CarController(CarControllerBase):
       lkas_enabled = CC.latActive and not CS.steering_override
 
       if lkas_enabled:
-        # Update steering angle request with user input torque
-        apply_angle = torque_blended_angle(actuators.steeringAngleDeg, CS.out.steeringTorque)
+        if self.virtual_blending:
+          # Update steering angle request with user input torque
+          apply_angle = torque_blended_angle(actuators.steeringAngleDeg, CS.out.steeringTorque)
+        else:
+          apply_angle = actuators.steeringAngleDeg
 
         # Angular rate limit based on speed
         apply_angle = apply_std_steer_angle_limits(apply_angle, self.apply_angle_last, CS.out.vEgo, CarControllerParams)
@@ -93,7 +97,13 @@ class CarController(CarControllerBase):
       counter = CS.das_control["DAS_controlCounter"]
       can_sends.append(self.tesla_can.create_longitudinal_commands(acc_state, target_speed, min_accel, max_accel, counter))
 
-    if self.frame % 10 == 0 and pcm_cancel_cmd:
+    if not self.virtual_blending:
+      # Cancel on user steering override when blending is disabled
+      if CS.steering_override:
+        pcm_cancel_cmd = True
+
+    # Send cancel request only if ACC is enabled
+    if self.frame % 10 == 0 and pcm_cancel_cmd and CS.acc_enabled:
       counter = int(CS.sccm_right_stalk_counter)
       can_sends.append(self.tesla_can.right_stalk_press((counter + 1) % 16 , 1))  # half up (cancel acc)
 
